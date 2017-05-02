@@ -68,7 +68,9 @@ Jison.Parser = do ->
       """
 
   Production = typal.construct
-    constructor: (@head, @body, @id, @precedence = 0) ->
+    constructor: (opts) ->
+      {@head, @body, @id, @precedence} = opts
+      @precedence ?= 0
       @nullable = no
       @first = []
     toString: ->
@@ -100,7 +102,7 @@ Jison.Parser = do ->
         DEBUG: debug or no
       }
 
-      @mix generatorDebug if @DEBUG # mixin debug methods
+      @mix generatorDebugMixin if @DEBUG
 
       @processGrammar grammar
 
@@ -152,11 +154,11 @@ Jison.Parser = do ->
       @productions = []
       @productions_ = [0]
       @nonterminals = {}
-      for own head, handles of bnf
+      for own head, bodyActions of bnf
         @addSymbol head
         @addNonterminal head
 
-        @buildProduction { handle, head } for handle in toList handles, (str) -> str.split /\s*\|\s*/g
+        @buildProduction { bodyAction, head } for bodyAction in toList bodyActions, (str) -> str.split /\s*\|\s*/g
 
       for action, caseClauses of actionGroups
         actions.push caseClauses.join(' '), action, 'break;'
@@ -197,12 +199,12 @@ Jison.Parser = do ->
       @symbols_[symbol] = ++@_symbolId
       @symbols.push symbol
 
-    buildProduction: ({handle, head}) ->
+    buildProduction: ({bodyAction, head}) ->
       @addProduction {
         head
         production: do =>
-          if isArray handle
-            [body, action, opts] = handle
+          if isArray bodyAction
+            [body, action, opts] = bodyAction
             body = toList body
             if isString action
               actionSpecified = yes
@@ -210,7 +212,7 @@ Jison.Parser = do ->
               opts = action
           else
             body =
-              @stripAliases handle
+              @stripAliases bodyAction
               .trim().split ' '
 
           for symbol in body
@@ -222,12 +224,12 @@ Jison.Parser = do ->
             action = @replaceActionVars { action, body }
             (actionGroups[action] ?= []).push "case #{ newProductionId }:"
 
-          @setMissingPrecedence new Production(
+          @setMissingPrecedence new Production {
             head
-            body.map @stripAliases
-            newProductionId
-            @operators[opts.prec].precedence if opts and @operators[opts.prec]
-          )
+            body: body.map @stripAliases
+            id: newProductionId
+            precedence: @operators[opts.prec].precedence if opts and @operators[opts.prec]
+          }
       }
 
     stripAliases: (symbol) ->
@@ -345,18 +347,20 @@ Jison.Parser = do ->
       throw new Error 'Grammar error: startSymbol must be a non-terminal found in your grammar.' unless @nonterminals[@startSymbol]
       @EOF = '$end'
 
-      # augment the grammar
-      acceptProduction = new Production '$accept', [@startSymbol, '$end'], 0
+      # add new first/starting production
+      acceptProduction = new Production
+        head: '$accept'
+        body: [@startSymbol, @EOF]
+        id: 0
       @productions.unshift acceptProduction
 
       # prepend parser tokens
       @symbols.unshift '$accept', @EOF
       @symbols_.$accept = 0
       @symbols_[@EOF] = 1
-      @terminals.unshift @EOF
-
       @addNonterminal '$accept', (acceptNonterminal) ->
         acceptNonterminal.productions.push acceptProduction
+      @terminals.unshift @EOF
 
       # add follow $ to start symbol
       @nonterminals[@startSymbol].follows.push @EOF
@@ -377,11 +381,9 @@ Jison.Parser = do ->
     error: (msg) ->
       throw new Error msg
 
-  # Generator debug mixin
-
-  generatorDebug =
+  generatorDebugMixin =
     trace: ->
-      Jison.print.apply null, arguments
+      Jison.print arguments...
     beforeprocessGrammar: ->
       @trace 'Processing grammar.'
     afteraugmentGrammar: ->
@@ -389,13 +391,12 @@ Jison.Parser = do ->
         @trace "#{ sym }(#{ i })"
 
 
-
   ###
   # Mixin for common behaviors of lookahead parsers
   ###
   lookaheadMixin =
     computeLookaheads: ->
-      @mix lookaheadDebug if @DEBUG # mixin debug methods
+      @mix lookaheadDebugMixin if @DEBUG
 
       @computeLookaheads = ->
       do @nullableSets
@@ -521,8 +522,7 @@ Jison.Parser = do ->
       ifNonterminal nonterminal
 
 
-  # lookahead debug mixin
-  lookaheadDebug =
+  lookaheadDebugMixin =
     beforenullableSets: ->
       @trace 'Computing Nullable sets.'
     beforefirstSets: ->
@@ -534,7 +534,7 @@ Jison.Parser = do ->
         @trace nonterminal, '\n'
 
   var NONASSOC = 0;
-  lrGeneratorMixin.parseTable = function parseTable (itemSets) {
+  lrGeneratorMixin.parseTable: ->
       var states = [],
           nonterminals = this.nonterminals,
           operators = this.operators,
@@ -545,7 +545,7 @@ Jison.Parser = do ->
           a = 3; // accept
 
       // for each item set
-      itemSets.forEach(function (itemSet, k) {
+      @states.forEach(function (itemSet, k) {
           var state = states[k] = {};
           var action, stackSymbol;
 
@@ -622,7 +622,7 @@ Jison.Parser = do ->
           self.warn("\nStates with conflicts:");
           each(conflictedStates, function (val, state) {
               self.warn('State '+state);
-              self.warn('  ',itemSets.item(state).join("\n  "));
+              self.warn('  ',@states[state].join("\n  "));
           });
       }
 
@@ -687,10 +687,10 @@ Jison.Parser = do ->
   ###
   lrGeneratorMixin =
     buildTable: ->
-      @mix lrGeneratorDebug if @DEBUG # mixin debug methods
+      @mix lrGeneratorDebugMixin if @DEBUG
 
-      @states = do @canonicalCollection
-      @table = @parseTable @states
+      do @canonicalCollection
+      @table = do @parseTable
       @defaultActions = findDefaults @table
 
     ###
@@ -699,29 +699,31 @@ Jison.Parser = do ->
     canonicalCollection: ->
       firstState =
         @closureOperation(
-          new @ItemSet(
-            new @Item @productions[0], 0, [@EOF]
-          ))
-      states = new Set firstState
-      marked = 0
+          new @Item
+            production: @productions[0]
+            follows: [@EOF]
+        )
+      @states = []
+      @states.has = {}
+      @newOrExistingStateNum firstState
 
-      states.has = {}
-      states.has[firstState] = 0
+      stateNum = -1
+      while ++stateNum isnt @states.length
+        state = @states[stateNum]
+        @canonicalCollectionInsert {
+          markedSymbol, state
+        } for {markedSymbol} in state when markedSymbol and markedSymbol isnt @EOF
 
-      while marked isnt do states.size
-        itemSet = states.item marked
-        marked++
-        for item of itemSet
-          if item.markedSymbol and item.markedSymbol isnt @EOF
-            @canonicalCollectionInsert item.markedSymbol, itemSet, states, marked - 1
-
-      states
+      @states
 
     Item: typal.construct
-      constructor: (@production, @dotPosition=0, @follows=[], @predecessor) ->
-        @id = parseInt "#{ production.id }a#{ @dotPosition }", 36
+      constructor: (opts) ->
+        {@production, @dotPosition, @follows} = opts
+        @dotPosition ?= 0
+        @follows ?= []
+        @id = parseInt "#{ @production.id }a#{ @dotPosition }", 36
         @markedSymbol = @production.body[@dotPosition]
-      remainingHandle: ->
+      remainingBody: ->
         @production.body[@dotPosition + 1..]
       eq: ({id}) ->
         id is @id
@@ -762,33 +764,36 @@ Jison.Parser = do ->
       valueOf: ->
         val =
           @_items
-          .map (a) -> a.id
+          .map ({id}) -> id
           .sort()
           .join '|'
         @valueOf = -> val
         val
 
     closureOperation: (itemSet) ->
+      itemSet = new @ItemSet arguments... unless itemSet instanceof @ItemSet
+      return itemSet if do itemSet.isEmpty
+
       closureSet = new @ItemSet
       set = itemSet
-      syms = {}
+      alreadyAddedNonterminals = {}
       loop
         itemQueue = new Set
         closureSet.concat set
         set.forEach (item) =>
           {markedSymbol: symbol} = item
 
-          # if token is a non-terminal, recursively add closures
-          if symbol and @nonterminals[symbol]
-            unless syms[symbol]
-              @nonterminals[symbol].productions.forEach (production) =>
-                newItem = new @Item production, 0
-                itemQueue.push newItem unless closureSet.contains newItem
-              syms[symbol] = yes
-          else if not symbol
+          if not symbol
             # reduction
             closureSet.reductions.push item
             closureSet.inadequate = closureSet.reductions.length > 1 or closureSet.shifts
+          else if @nonterminals[symbol]
+            # if token is a non-terminal, recursively add closures
+            unless alreadyAddedNonterminals[symbol]
+              @nonterminals[symbol].productions.forEach (production) =>
+                newItem = new @Item { production }
+                itemQueue.push newItem unless closureSet.contains newItem
+              alreadyAddedNonterminals[symbol] = yes
           else
             # shift
             closureSet.shifts = yes
@@ -801,34 +806,30 @@ Jison.Parser = do ->
       closureSet
 
     # Pushes a unique state into the que. Some parsing algorithms may perform additional operations
-    canonicalCollectionInsert: (symbol, itemSet, states, stateNum) ->
-      gotoSet = @gotoOperation itemSet, symbol
-      gotoSet.predecessors ?= {}
-      # add gotoSet to que if not empty or duplicate
-      unless do gotoSet.isEmpty
-        val = do gotoSet.valueOf
-        i = states.has[val]
-        if i is -1 or not i?
-          states.has[val] = do states.size
-          itemSet.edges[symbol] = do states.size # store goto transition for table
-          states.push gotoSet
-          gotoSet.predecessors[symbol] = [stateNum]
-        else
-          itemSet.edges[symbol] = i # store goto transition for table
-          states.item(i).predecessors[symbol].push stateNum
+    canonicalCollectionInsert: ({markedSymbol, state}) ->
+      gotoSet = @gotoOperation { state, markedSymbol }
+      # add gotoSet to states if not empty or duplicate
+      return if do gotoSet.isEmpty
+      state.edges[markedSymbol] = @newOrExistingStateNum gotoSet # store goto transition for table
 
-    gotoOperation: (itemSet, symbol) ->
-      gotoSet = new @ItemSet(
-        new @Item(
+    newOrExistingStateNum: (state) ->
+      stateVal = do state.valueOf
+      alreadyHasState = @states.has[stateVal]
+      return alreadyHasState if alreadyHasState? and alreadyHasState isnt -1
+
+      @states.push state
+      newStateNum = @states.length - 1
+      @states.has[stateVal] = newStateNum
+      newStateNum
+
+    gotoOperation: ({state, markedSymbol: _markedSymbol}) ->
+      @closureOperation(
+        new @Item {
           production
-          dotPosition + 1
+          dotPosition: dotPosition + 1
           follows
-          n
-        ) for n, {markedSymbol, production, dotPosition, follows} of itemSet when markedSymbol is symbol
+        } for {markedSymbol, production, dotPosition, follows} in state._items when markedSymbol is _markedSymbol
       )
-
-      return gotoSet if do gotoSet.isEmpty
-      @closureOperation gotoSet
 
     generate: (opt) ->
       opt = typal.mix.call {}, @options, opt
@@ -1207,41 +1208,32 @@ Jison.Parser = do ->
       return exports.parser.parse(source);
   }
 
-  // debug mixin for LR parser generators
+  # debug mixin for LR parser generators
+  lrGeneratorDebugMixin =
+    beforeparseTable: ->
+      @trace 'Building parse table.'
+    afterparseTable: ->
+      printAction = (action) =>
+        switch action[0]
+          when 1 then "shift token (then go to state #{ action[1] })"
+          when 2 then "reduce by rule: #{ @productions[action[1]]}"
+          else        'accept'
 
-  function printAction (a, gen) {
-      var s = a[0] == 1 ? 'shift token (then go to state '+a[1]+')' :
-          a[0] == 2 ? 'reduce by rule: '+gen.productions[a[1]] :
-                      'accept' ;
+      if @conflicts
+        @resolutions.forEach ([state, token, {bydefault, r, s}]) =>
+          if bydefault
+            @warn 'Conflict at state: ', state, ', token: ', token, '\n  ', printAction(r), '\n  ', printAction s
+        @trace "\n#{ @conflicts } Conflict(s) found in grammar."
+      @trace 'Done.'
+    aftercanonicalCollection: (states) ->
+      @trace """
+      
+      Item sets
+      ------
+      """
 
-      return s;
-  }
-
-  var lrGeneratorDebug = {
-      beforeparseTable: function () {
-          this.trace("Building parse table.");
-      },
-      afterparseTable: function () {
-          var self = this;
-          if (this.conflicts > 0) {
-              this.resolutions.forEach(function (r, i) {
-                  if (r[2].bydefault) {
-                      self.warn('Conflict at state: ',r[0], ', token: ',r[1], "\n  ", printAction(r[2].r, self), "\n  ", printAction(r[2].s, self));
-                  }
-              });
-              this.trace("\n"+this.conflicts+" Conflict(s) found in grammar.");
-          }
-          this.trace("Done.");
-      },
-      aftercanonicalCollection: function (states) {
-          var trace = this.trace;
-          trace("\nItem sets\n------");
-
-          states.forEach(function (state, i) {
-              trace("\nitem set",i,"\n"+state.join("\n"), '\ntransitions -> ', JSON.stringify(state.edges));
-          });
-      }
-  };
+      states.forEach (state, i) =>
+        @trace '\nitem set', i, "\n#{ state.join '\n' }", '\ntransitions -> ', JSON.stringify state.edges
 
   var parser = typal.beget();
 
@@ -1265,287 +1257,259 @@ Jison.Parser = do ->
 
   parser.parseError = lrGeneratorMixin.parseError = parseError;
 
-  /*
-   * LR(0) Parser
-   * */
+  generators = {}
+  registerGenerator = (name, klass, construct=yes) ->
+    generators[name] = exports["#{ do name.toUpperCase }Generator"] =
+      if contruct
+        do klass.construct
+      else
+        klass
 
-  var lr0 = generator.beget(lookaheadMixin, lrGeneratorMixin, {
-      type: "LR(0)",
-      afterconstructor: function lr0_afterconstructor () {
-          this.buildTable();
-      }
-  });
+  ###
+  # LR(0) Parser
+  ###
+  registerGenerator 'lr0', generator.beget lookaheadMixin, lrGeneratorMixin,
+    type: 'LR(0)'
+    afterconstructor: ->
+      do @buildTable
 
-  var LR0Generator = exports.LR0Generator = lr0.construct();
+  ###
+  # Simple LALR(1)
+  ###
+  registerGenerator 'lalr', generator.beget lookaheadMixin, lrGeneratorMixin,
+    type: 'LALR(1)'
 
-  /*
-   * Simple LALR(1)
-   * */
+    afterconstructor: function (grammar, options) {
+        if (this.DEBUG) this.mix(lrGeneratorDebugMixin, lalrGeneratorDebug); // mixin debug methods
 
-  var lalr = generator.beget(lookaheadMixin, lrGeneratorMixin, {
-      type: "LALR(1)",
+        options = options || {};
+        this.canonicalCollection();
+        this.terms_ = {};
 
-      afterconstructor: function (grammar, options) {
-          if (this.DEBUG) this.mix(lrGeneratorDebug, lalrGeneratorDebug); // mixin debug methods
+        var newg = this.newg = typal.beget(lookaheadMixin,{
+            oldg: this,
+            trace: this.trace,
+            nterms_: {},
+            DEBUG: false,
+            go_: function (r, B) {
+                r = r.split(":")[0]; // grab state #
+                B = B.map(function (b) { return b.slice(b.indexOf(":")+1); });
+                return this.oldg.go(r, B);
+            }
+        });
+        newg.nonterminals = {};
+        newg.productions = [];
 
-          options = options || {};
-          this.states = this.canonicalCollection();
-          this.terms_ = {};
+        this.inadequateStates = [];
 
-          var newg = this.newg = typal.beget(lookaheadMixin,{
-              oldg: this,
-              trace: this.trace,
-              nterms_: {},
-              DEBUG: false,
-              go_: function (r, B) {
-                  r = r.split(":")[0]; // grab state #
-                  B = B.map(function (b) { return b.slice(b.indexOf(":")+1); });
-                  return this.oldg.go(r, B);
-              }
-          });
-          newg.nonterminals = {};
-          newg.productions = [];
+        // if true, only lookaheads in inadequate states are computed (faster, larger table)
+        // if false, lookaheads for all reductions will be computed (slower, smaller table)
+        this.onDemandLookahead = options.onDemandLookahead || false;
 
-          this.inadequateStates = [];
+        this.buildNewGrammar();
+        newg.computeLookaheads();
+        this.unionLookaheads();
 
-          // if true, only lookaheads in inadequate states are computed (faster, larger table)
-          // if false, lookaheads for all reductions will be computed (slower, smaller table)
-          this.onDemandLookahead = options.onDemandLookahead || false;
+        this.table = this.parseTable();
+        this.defaultActions = findDefaults(this.table);
+    },
 
-          this.buildNewGrammar();
-          newg.computeLookaheads();
-          this.unionLookaheads();
+    lookAheads: function LALR_lookaheads (state, item) {
+        return (!!this.onDemandLookahead && !state.inadequate) ? this.terminals : item.follows;
+    },
+    go: function LALR_go (p, w) {
+        var q = parseInt(p, 10);
+        for (var i=0;i<w.length;i++) {
+            q = this.states[q].edges[w[i]] || q;
+        }
+        return q;
+    },
+    goPath: function LALR_goPath (p, w) {
+        var q = parseInt(p, 10),t,
+            path = [];
+        for (var i=0;i<w.length;i++) {
+            t = w[i] ? q+":"+w[i] : '';
+            if (t) this.newg.nterms_[t] = q;
+            path.push(t);
+            q = this.states[q].edges[w[i]] || q;
+            this.terms_[t] = w[i];
+        }
+        { path, endState: q }
+    # every disjoint reduction of a nonterminal becomes a produciton in G'
+    buildNewGrammar: ->
+        var self = this,
+            newg = this.newg;
 
-          this.table = this.parseTable(this.states);
-          this.defaultActions = findDefaults(this.table);
-      },
+        this.states.forEach(function (state, i) {
+            state.forEach(function (item) {
+                if (item.dotPosition === 0) {
+                    # new symbols are a combination of state and transition symbol
+                    var symbol = i+":"+item.production.head;
+                    self.terms_[symbol] = item.production.head;
+                    newg.nterms_[symbol] = i;
+                    if (!newg.nonterminals[symbol])
+                        newg.nonterminals[symbol] = new Nonterminal(symbol);
+                    var pathInfo = self.goPath(i, item.production.body);
+                    var p = new Production(head: symbol, body: pathInfo.path, id: newg.productions.length);
+                    newg.productions.push(p);
+                    newg.nonterminals[symbol].productions.push(p);
 
-      lookAheads: function LALR_lookaheads (state, item) {
-          return (!!this.onDemandLookahead && !state.inadequate) ? this.terminals : item.follows;
-      },
-      go: function LALR_go (p, w) {
-          var q = parseInt(p, 10);
-          for (var i=0;i<w.length;i++) {
-              q = this.states.item(q).edges[w[i]] || q;
-          }
-          return q;
-      },
-      goPath: function LALR_goPath (p, w) {
-          var q = parseInt(p, 10),t,
-              path = [];
-          for (var i=0;i<w.length;i++) {
-              t = w[i] ? q+":"+w[i] : '';
-              if (t) this.newg.nterms_[t] = q;
-              path.push(t);
-              q = this.states.item(q).edges[w[i]] || q;
-              this.terms_[t] = w[i];
-          }
-          return {path: path, endState: q};
-      },
-      # every disjoint reduction of a nonterminal becomes a produciton in G'
-      buildNewGrammar: function LALR_buildNewGrammar () {
-          var self = this,
-              newg = this.newg;
+                    # store the transition that get's 'backed up to' after reduction on path
+                    var body = item.production.body.join(' ');
+                    var goes = self.states[pathInfo.endState].goes;
+                    if (!goes[body])
+                        goes[body] = [];
+                    goes[body].push(symbol);
 
-          this.states.forEach(function (state, i) {
-              state.forEach(function (item) {
-                  if (item.dotPosition === 0) {
-                      // new symbols are a combination of state and transition symbol
-                      var symbol = i+":"+item.production.head;
-                      self.terms_[symbol] = item.production.head;
-                      newg.nterms_[symbol] = i;
-                      if (!newg.nonterminals[symbol])
-                          newg.nonterminals[symbol] = new Nonterminal(symbol);
-                      var pathInfo = self.goPath(i, item.production.body);
-                      var p = new Production(symbol, pathInfo.path, newg.productions.length);
-                      newg.productions.push(p);
-                      newg.nonterminals[symbol].productions.push(p);
+                    #self.trace('new production:',p);
+                }
+            });
+            if (state.inadequate)
+                self.inadequateStates.push(i);
+        });
+    unionLookaheads: function LALR_unionLookaheads () {
+        var self = this,
+            newg = this.newg,
+            states = !!this.onDemandLookahead ? this.inadequateStates : this.states;
 
-                      // store the transition that get's 'backed up to' after reduction on path
-                      var body = item.production.body.join(' ');
-                      var goes = self.states.item(pathInfo.endState).goes;
-                      if (!goes[body])
-                          goes[body] = [];
-                      goes[body].push(symbol);
+        states.forEach(function union_states_forEach (i) {
+            var state = typeof i === 'number' ? self.states[i] : i,
+                follows = [];
+            if (state.reductions.length)
+            state.reductions.forEach(function union_reduction_forEach (item) {
+                var follows = {};
+                for (var k=0;k<item.follows.length;k++) {
+                    follows[item.follows[k]] = true;
+                state.goes[item.production.body.join(' ')].forEach(function reduction_goes_forEach (symbol) {
+                    newg.nonterminals[symbol].follows.forEach(function goes_follows_forEach (symbol) {
+                        var terminal = self.terms_[symbol];
+                        if (!follows[terminal]) {
+                            follows[terminal]=true;
+                            item.follows.push(terminal);
+                #self.trace('unioned item', item);
 
-                      //self.trace('new production:',p);
-                  }
-              });
-              if (state.inadequate)
-                  self.inadequateStates.push(i);
-          });
-      },
-      unionLookaheads: function LALR_unionLookaheads () {
-          var self = this,
-              newg = this.newg,
-              states = !!this.onDemandLookahead ? this.inadequateStates : this.states;
+  # LALR generator debug mixin
+  lalrGeneratorDebug =
+    trace: ->
+      Jison.print arguments...
+    beforebuildNewGrammar: ->
+      @trace "#{ @states.length } states."
+      @trace 'Building lookahead grammar.'
+    beforeunionLookaheads: ->
+      @trace 'Computing lookaheads.'
 
-          states.forEach(function union_states_forEach (i) {
-              var state = typeof i === 'number' ? self.states.item(i) : i,
-                  follows = [];
-              if (state.reductions.length)
-              state.reductions.forEach(function union_reduction_forEach (item) {
-                  var follows = {};
-                  for (var k=0;k<item.follows.length;k++) {
-                      follows[item.follows[k]] = true;
-                  }
-                  state.goes[item.production.body.join(' ')].forEach(function reduction_goes_forEach (symbol) {
-                      newg.nonterminals[symbol].follows.forEach(function goes_follows_forEach (symbol) {
-                          var terminal = self.terms_[symbol];
-                          if (!follows[terminal]) {
-                              follows[terminal]=true;
-                              item.follows.push(terminal);
-                          }
-                      });
-                  });
-                  //self.trace('unioned item', item);
-              });
-          });
-      }
-  });
-
-  var LALRGenerator = exports.LALRGenerator = lalr.construct();
-
-  // LALR generator debug mixin
-
-  var lalrGeneratorDebug = {
-      trace: function trace () {
-          Jison.print.apply(null, arguments);
-      },
-      beforebuildNewGrammar: function () {
-          this.trace(this.states.size()+" states.");
-          this.trace("Building lookahead grammar.");
-      },
-      beforeunionLookaheads: function () {
-          this.trace("Computing lookaheads.");
-      }
-  };
-
-  /*
-   * Lookahead parser definitions
-   *
-   * Define base type
-   * */
-  var lrLookaheadGenerator = generator.beget(lookaheadMixin, lrGeneratorMixin, {
-      afterconstructor: function lr_aftercontructor () {
-          this.computeLookaheads();
-          this.buildTable();
-      }
-  });
-
-  /*
-   * SLR Parser
-   * */
-  var SLRGenerator = exports.SLRGenerator = lrLookaheadGenerator.construct({
-      type: "SLR(1)",
-
-      lookAheads: function SLR_lookAhead (state, item) {
-          return this.nonterminals[item.production.head].follows;
-      }
-  });
-
-
-  /*
-   * LR(1) Parser
-   * */
-  var lr1 = lrLookaheadGenerator.beget({
-      type: "Canonical LR(1)",
-
-      lookAheads: function LR_lookAheads (state, item) {
-          return item.follows;
-      },
-      Item: lrGeneratorMixin.Item.prototype.construct({
-          afterconstructor: function () {
-              this.id = this.production.id+'a'+this.dotPosition+'a'+this.follows.sort().join(',');
-          },
-          eq: function (e) {
-              return e.id === this.id;
-          }
-      }),
-
-      closureOperation: function LR_ClosureOperation (itemSet /*, closureSet*/) {
-          var closureSet = new this.ItemSet();
-          var self = this;
-
-          var set = itemSet,
-              itemQueue, syms = {};
-
-          do {
-          itemQueue = new Set();
-          closureSet.concat(set);
-          set.forEach(function (item) {
-              var symbol = item.markedSymbol;
-              var b, r;
-
-              // if token is a nonterminal, recursively add closures
-              if (symbol && self.nonterminals[symbol]) {
-                  r = item.remainingHandle();
-                  b = self.first(item.remainingHandle());
-                  if (b.length === 0 || item.production.nullable || self.nullable(r)) {
-                      b = b.concat(item.follows);
-                  }
-                  self.nonterminals[symbol].productions.forEach(function (production) {
-                      var newItem = new self.Item(production, 0, b);
-                      if(!closureSet.contains(newItem) && !itemQueue.contains(newItem)) {
-                          itemQueue.push(newItem);
-                      }
-                  });
-              } else if (!symbol) {
-                  // reduction
-                  closureSet.reductions.push(item);
-              }
-          });
-
-          set = itemQueue;
-          } while (!itemQueue.isEmpty());
-
-          return closureSet;
-      }
-  });
-
-  var LR1Generator = exports.LR1Generator = lr1.construct();
-
-  /*
-   * LL Parser
-   * */
-  ll = generator.beget lookaheadMixin,
-    type: 'LL(1)'
-
+  ###
+  # Lookahead parser definitions
+  #
+  # Define base type
+  ###
+  lrLookaheadGenerator = generator.beget lookaheadMixin, lrGeneratorMixin,
     afterconstructor: ->
       do @computeLookaheads
-      @table = @parseTable @productions
-    parseTable: (productions) ->
-      table = {}
-      productions.forEach (production, productionIndex) =>
-        {head, first, body} = production
-        row = table[head] or {}
-        tokens = first
-        Set.union tokens, @nonterminals[head].follows if @nullable body
-        tokens.forEach (token) =>
-          if row[token]
-            row[token].push productionIndex
-            @conflicts++
-          else
-            row[token] = [productionIndex]
-        table[head] = row
-      table
+      do @buildTable
 
-  var LLGenerator = exports.LLGenerator = ll.construct();
+  ###
+  # SLR Parser
+  ###
+  registerGenerator 'slr', lrLookaheadGenerator.construct
+    type: 'SLR(1)'
 
-  Jison.Generator = (g, options) ->
-    opt = typal.mix.call {}, g.options, options
-    switch opt.type
-      when 'lr0'
-        new LR0Generator g, opt
-      when 'slr'
-        new SLRGenerator g, opt
-      when 'lr'
-        new LR1Generator g, opt
-      when 'll'
-        new LLGenerator g, opt
-      else
-        new LALRGenerator g, opt
+    lookAheads: (state, item) ->
+      @nonterminals[item.production.head].follows
+  , no
 
-  (g, options) ->
-    Jison.Generator g, options
+  ###
+  # LR(1) Parser
+  ###
+  registerGenerator 'lr1', lrLookaheadGenerator.beget
+    type: "Canonical LR(1)",
+
+    lookAheads: function LR_lookAheads (state, item) {
+        return item.follows;
+    },
+    Item: lrGeneratorMixin.Item.prototype.construct({
+        afterconstructor: function () {
+            this.id = this.production.id+'a'+this.dotPosition+'a'+this.follows.sort().join(',');
+        },
+        eq: function (e) {
+            return e.id === this.id;
+        }
+    }),
+
+    closureOperation: function LR_ClosureOperation (itemSet /*, closureSet*/) {
+      itemSet = new @ItemSet arguments... unless itemSet instanceof @ItemSet
+      return itemSet if do itemSet.isEmpty
+        var closureSet = new this.ItemSet();
+        var self = this;
+
+        var set = itemSet,
+            itemQueue, syms = {};
+
+        do {
+        itemQueue = new Set();
+        closureSet.concat(set);
+        set.forEach(function (item) {
+            var symbol = item.markedSymbol;
+            var b, r;
+
+            // if token is a nonterminal, recursively add closures
+            if (symbol && self.nonterminals[symbol]) {
+                r = item.remainingBody();
+                b = self.first(item.remainingBody());
+                if (b.length === 0 || item.production.nullable || self.nullable(r)) {
+                    b = b.concat(item.follows);
+                }
+                self.nonterminals[symbol].productions.forEach(function (production) {
+                    var newItem = new self.Item({production, dotPosition: 0, follows: b);
+                    if(!closureSet.contains(newItem) && !itemQueue.contains(newItem)) {
+                        itemQueue.push(newItem);
+                    }
+                });
+            } else if (!symbol) {
+                // reduction
+                closureSet.reductions.push(item);
+            }
+        });
+
+        set = itemQueue;
+        } while (!itemQueue.isEmpty());
+
+        return closureSet;
+    }
+
+
+
+  ###
+  # LL Parser
+  ###
+  registerGenerator 'll',
+    generator.beget lookaheadMixin,
+      type: 'LL(1)'
+
+      afterconstructor: ->
+        do @computeLookaheads
+        @table = @parseTable @productions
+      parseTable: (productions) ->
+        table = {}
+        productions.forEach (production, productionIndex) =>
+          {head, first, body} = production
+          row = table[head] or {}
+          tokens = first
+          Set.union tokens, @nonterminals[head].follows if @nullable body
+          tokens.forEach (token) =>
+            if row[token]
+              row[token].push productionIndex
+              @conflicts++
+            else
+              row[token] = [productionIndex]
+          table[head] = row
+        table
+
+  Jison.Generator = (grammar, options) ->
+    opt = extended grammar.options, options
+    klass = generators[opt.type] ? generators.lalr
+    new klass grammar, opt
+
+  (grammar, options) ->
+    Jison.Generator grammar, options
     .createParser()
