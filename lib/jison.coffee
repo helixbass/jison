@@ -37,6 +37,8 @@ Jison.Parser = do ->
 
   isString = (obj) ->
     typeof obj is 'string'
+  isNumber = (obj) ->
+    typeof obj is 'number'
   isArray = (obj) ->
     obj.constructor is Array
   isFunction = (obj) ->
@@ -51,7 +53,7 @@ Jison.Parser = do ->
 
     listOrString[...]
 
-  Nonterminal = typal.construct
+  class Nonterminal
     constructor: (@symbol) ->
       @productions = new Set
       @first = []
@@ -67,7 +69,7 @@ Jison.Parser = do ->
         #{ @productions.join '\n  ' }
       """
 
-  Production = typal.construct
+  class Production
     constructor: (opts) ->
       {@head, @body, @id, @precedence} = opts
       @precedence ?= 0
@@ -142,17 +144,17 @@ Jison.Parser = do ->
         'var $0 = $$.length - 1;'
         'switch (yystate) {'
       ]
-      actionGroups = {}
+      @actionGroups = {}
 
       @hasErrorRecovery = no
 
-      @symbols_ = {}
+      @symbols_ = {} # symbol => symbolId
       @symbols = []
       # add error symbol; will be third symbol, or "2" ($accept, $end, error)
       @addSymbol 'error'
 
       @productions = []
-      @productions_ = [0]
+      @productions_ = [0] # [..., [headSymbolId, bodyLength], ...]
       @nonterminals = {}
       for own head, bodyActions of bnf
         @addSymbol head
@@ -160,16 +162,16 @@ Jison.Parser = do ->
 
         @buildProduction { bodyAction, head } for bodyAction in toList bodyActions, (str) -> str.split /\s*\|\s*/g
 
-      for action, caseClauses of actionGroups
+      for action, caseClauses of @actionGroups
         actions.push caseClauses.join(' '), action, 'break;'
 
-      @terminals = []
-      @terminals_ = {}
-      each @symbols_, (id, sym) =>
-        return if @nonterminals[sym]
+      @terminals = [] # [..., symbol, ...]
+      @terminals_ = {} # symbolId => symbol
+      each @symbols_, (symbolId, symbol) =>
+        return if @nonterminals[symbol]
 
-        @terminals.push sym
-        @terminals_[id] = sym
+        @terminals.push symbol
+        @terminals_[symbolId] = symbol
 
       actions.push '}'
 
@@ -200,37 +202,33 @@ Jison.Parser = do ->
       @symbols.push symbol
 
     buildProduction: ({bodyAction, head}) ->
-      @addProduction {
-        head
-        production: do =>
-          if isArray bodyAction
-            [body, action, opts] = bodyAction
-            body = toList body
-            if isString action
-              actionSpecified = yes
-            else
-              opts = action
+      @addProduction do =>
+        if isArray bodyAction
+          [body, action, opts] = bodyAction
+          body = toList body
+          if isString action
+            actionSpecified = yes
           else
-            body =
-              @stripAliases bodyAction
-              .trim().split ' '
+            opts = action
+        else
+          body =
+            @stripAliases bodyAction
+            .trim().split ' '
 
-          for symbol in body
-            @hasErrorRecovery = yes if symbol is 'error'
-            @addSymbol symbol
+        for symbol in body
+          @hasErrorRecovery = yes if symbol is 'error'
+          @addSymbol symbol
 
-          newProductionId = @productions.length + 1
-          if actionSpecified
-            action = @replaceActionVars { action, body }
-            (actionGroups[action] ?= []).push "case #{ newProductionId }:"
+        newProductionId = @productions.length + 1
+        (@actionGroups[@replaceActionVars { action, body }] ?= [])
+        .push "case #{ newProductionId }:" if actionSpecified
 
-          @setMissingPrecedence new Production {
-            head
-            body: body.map @stripAliases
-            id: newProductionId
-            precedence: @operators[opts.prec].precedence if opts and @operators[opts.prec]
-          }
-      }
+        @setMissingPrecedence new Production {
+          head
+          body: body.map @stripAliases
+          id: newProductionId
+          precedence: @operators[opts.prec].precedence if opts and @operators[opts.prec]
+        }
 
     stripAliases: (symbol) ->
       symbol.replace ///
@@ -329,14 +327,15 @@ Jison.Parser = do ->
           production.precedence = @operators[symbol].precedence
       production
 
-    addProduction: ({production, head}) ->
+    addProduction: ( production ) ->
+      {head, body} = production
       @productions.push production
       @productions_.push [
         @symbols_[head]
-        if production.body[0] is ''
+        if body[0] is ''
           0
         else
-          production.body.length
+          body.length
       ]
       @nonterminals[head].productions.push production
 
@@ -533,155 +532,6 @@ Jison.Parser = do ->
       each @nonterminals, (nonterminal) =>
         @trace nonterminal, '\n'
 
-  var NONASSOC = 0;
-  lrGeneratorMixin.parseTable: ->
-      var states = [],
-          nonterminals = this.nonterminals,
-          operators = this.operators,
-          conflictedStates = {}, // array of [state, token] tuples
-          self = this,
-          s = 1, // shift
-          r = 2, // reduce
-          a = 3; // accept
-
-      // for each item set
-      @states.forEach(function (itemSet, k) {
-          var state = states[k] = {};
-          var action, stackSymbol;
-
-          // set shift and goto actions
-          for (stackSymbol in itemSet.edges) {
-              itemSet.forEach(function (item, j) {
-                  // find shift and goto actions
-                  if (item.markedSymbol == stackSymbol) {
-                      var gotoState = itemSet.edges[stackSymbol];
-                      if (nonterminals[stackSymbol]) {
-                          // store state to go to after a reduce
-                          //self.trace(k, stackSymbol, 'g'+gotoState);
-                          state[self.symbols_[stackSymbol]] = gotoState;
-                      } else {
-                          //self.trace(k, stackSymbol, 's'+gotoState);
-                          state[self.symbols_[stackSymbol]] = [s,gotoState];
-                      }
-                  }
-              });
-          }
-
-          // set accept action
-          itemSet.forEach(function (item, j) {
-              if (item.markedSymbol == self.EOF) {
-                  // accept
-                  state[self.symbols_[self.EOF]] = [a];
-                  //self.trace(k, self.EOF, state[self.EOF]);
-              }
-          });
-
-          var allterms = self.lookAheads ? false : self.terminals;
-
-          // set reductions and resolve potential conflicts
-          itemSet.reductions.forEach(function (item, j) {
-              // if parser uses lookahead, only enumerate those terminals
-              var terminals = allterms || self.lookAheads(itemSet, item);
-
-              terminals.forEach(function (stackSymbol) {
-                  action = state[self.symbols_[stackSymbol]];
-                  var op = operators[stackSymbol];
-
-                  // Reading a terminal and current position is at the end of a production, try to reduce
-                  if (action || action && action.length) {
-                      var sol = resolveConflict(item.production, op, [r,item.production.id], action[0] instanceof Array ? action[0] : action);
-                      self.resolutions.push([k,stackSymbol,sol]);
-                      if (sol.bydefault) {
-                          self.conflicts++;
-                          if (!self.DEBUG) {
-                              self.warn('Conflict in grammar: multiple actions possible when lookahead token is ',stackSymbol,' in state ',k, "\n- ", printAction(sol.r, self), "\n- ", printAction(sol.s, self));
-                              conflictedStates[k] = true;
-                          }
-                          if (self.options.noDefaultResolve) {
-                              if (!(action[0] instanceof Array))
-                                  action = [action];
-                              action.push(sol.r);
-                          }
-                      } else {
-                          action = sol.action;
-                      }
-                  } else {
-                      action = [r,item.production.id];
-                  }
-                  if (action && action.length) {
-                      state[self.symbols_[stackSymbol]] = action;
-                  } else if (action === NONASSOC) {
-                      state[self.symbols_[stackSymbol]] = undefined;
-                  }
-              });
-          });
-
-      });
-
-      if (!self.DEBUG && self.conflicts > 0) {
-          self.warn("\nStates with conflicts:");
-          each(conflictedStates, function (val, state) {
-              self.warn('State '+state);
-              self.warn('  ',@states[state].join("\n  "));
-          });
-      }
-
-      return states;
-  };
-
-  # find states with only one action, a reduction
-  findDefaults  = (states) ->
-    defaults = {}
-    states.forEach (state, key) ->
-      return unless [action for own action of state].length is 1
-      loneAction = state[action]
-      return unless loneAction[0] is 2
-
-      # only one action in state and it's a reduction
-      defaults[key] = loneAction
-
-    defaults
-
-  // resolves shift-reduce and reduce-reduce conflicts
-  function resolveConflict (production, op, reduce, shift) {
-      var sln = {production: production, operator: op, r: reduce, s: shift},
-          s = 1, // shift
-          r = 2, // reduce
-          a = 3; // accept
-
-      if (shift[0] === r) {
-          sln.msg = "Resolve R/R conflict (use first production declared in grammar.)";
-          sln.action = shift[1] < reduce[1] ? shift : reduce;
-          if (shift[1] !== reduce[1]) sln.bydefault = true;
-          return sln;
-      }
-
-      if (production.precedence === 0 || !op) {
-          sln.msg = "Resolve S/R conflict (shift by default.)";
-          sln.bydefault = true;
-          sln.action = shift;
-      } else if (production.precedence < op.precedence ) {
-          sln.msg = "Resolve S/R conflict (shift for higher precedent operator.)";
-          sln.action = shift;
-      } else if (production.precedence === op.precedence) {
-          if (op.assoc === "right" ) {
-              sln.msg = "Resolve S/R conflict (shift for right associative operator.)";
-              sln.action = shift;
-          } else if (op.assoc === "left" ) {
-              sln.msg = "Resolve S/R conflict (reduce for left associative operator.)";
-              sln.action = reduce;
-          } else if (op.assoc === "nonassoc" ) {
-              sln.msg = "Resolve S/R conflict (no action for non-associative operator.)";
-              sln.action = NONASSOC;
-          }
-      } else {
-          sln.msg = "Resolve conflict (reduce for higher precedent production.)";
-          sln.action = reduce;
-      }
-
-      return sln;
-  }
-
   ###
   # Mixin for common LR parser behavior
   ###
@@ -691,7 +541,7 @@ Jison.Parser = do ->
 
       do @canonicalCollection
       @table = do @parseTable
-      @defaultActions = findDefaults @table
+      @defaultActions = do @findDefaults
 
     ###
     # Create unique set of item sets
@@ -712,16 +562,16 @@ Jison.Parser = do ->
         state = @states[stateNum]
         @canonicalCollectionInsert {
           markedSymbol, state
-        } for {markedSymbol} in state when markedSymbol and markedSymbol isnt @EOF
+        } for {markedSymbol} in state._items when markedSymbol and markedSymbol isnt @EOF
 
       @states
 
-    Item: typal.construct
+    Item: class Item
       constructor: (opts) ->
         {@production, @dotPosition, @follows} = opts
         @dotPosition ?= 0
         @follows ?= []
-        @id = parseInt "#{ @production.id }a#{ @dotPosition }", 36
+        @id = parseInt "#{ @production.id }a#{ @dotPosition }a#{ @follows.sort().join ',' }", 36
         @markedSymbol = @production.body[@dotPosition]
       remainingBody: ->
         @production.body[@dotPosition + 1..]
@@ -737,11 +587,12 @@ Jison.Parser = do ->
             " #lookaheads= #{ @follows.join ' ' }"
           else '' }"
 
-    ItemSet: Set.prototype.construct
-      afterconstructor: ->
+    ItemSet: class extends Set
+      constructor: ->
+        super
         @reductions = []
         @goes = {}
-        @edges = {}
+        @edges = {} # symbol => gotoStateNum
         @shifts = no
         @inadequate = no
         do @hashItems
@@ -770,7 +621,7 @@ Jison.Parser = do ->
         @valueOf = -> val
         val
 
-    closureOperation: (itemSet) ->
+    _closureOperation: ({itemSet, ifReduction, ifNonterminal, ifTerminal}) ->
       itemSet = new @ItemSet arguments... unless itemSet instanceof @ItemSet
       return itemSet if do itemSet.isEmpty
 
@@ -781,23 +632,18 @@ Jison.Parser = do ->
         itemQueue = new Set
         closureSet.concat set
         set.forEach (item) =>
-          {markedSymbol: symbol} = item
+          {markedSymbol} = item
 
-          if not symbol
+          if not markedSymbol
             # reduction
             closureSet.reductions.push item
-            closureSet.inadequate = closureSet.reductions.length > 1 or closureSet.shifts
-          else if @nonterminals[symbol]
+            ifReduction? { closureSet, item }
+          else if @nonterminals[markedSymbol]
             # if token is a non-terminal, recursively add closures
-            unless alreadyAddedNonterminals[symbol]
-              @nonterminals[symbol].productions.forEach (production) =>
-                newItem = new @Item { production }
-                itemQueue.push newItem unless closureSet.contains newItem
-              alreadyAddedNonterminals[symbol] = yes
+            ifNonterminal? { item, itemQueue, markedSymbol, closureSet, alreadyAddedNonterminals }
           else
             # shift
-            closureSet.shifts = yes
-            closureSet.inadequate = closureSet.reductions.length > 0
+            ifTerminal? { closureSet }
 
         break if do itemQueue.isEmpty
 
@@ -805,8 +651,25 @@ Jison.Parser = do ->
 
       closureSet
 
+    closureOperation: (itemSet) ->
+      @_closureOperation {
+        itemSet
+        ifReduction: ({ closureSet, item }) ->
+          closureSet.inadequate = closureSet.reductions.length > 1 or closureSet.shifts
+        ifNonterminal: ({ itemQueue, closureSet, markedSymbol, alreadyAddedNonterminals }) =>
+          unless alreadyAddedNonterminals[markedSymbol]
+            @nonterminals[markedSymbol].productions.forEach (production) =>
+              newItem = new @Item { production }
+              itemQueue.push newItem unless closureSet.contains newItem
+            alreadyAddedNonterminals[markedSymbol] = yes
+        ifTerminal: ({closureSet}) ->
+          closureSet.shifts = yes
+          closureSet.inadequate = closureSet.reductions.length > 0
+      }
+
     # Pushes a unique state into the que. Some parsing algorithms may perform additional operations
     canonicalCollectionInsert: ({markedSymbol, state}) ->
+      # TODO: optimize not recalculating gotoSet for items (in same state) w/ same markedSymbol
       gotoSet = @gotoOperation { state, markedSymbol }
       # add gotoSet to states if not empty or duplicate
       return if do gotoSet.isEmpty
@@ -831,8 +694,139 @@ Jison.Parser = do ->
         } for {markedSymbol, production, dotPosition, follows} in state._items when markedSymbol is _markedSymbol
       )
 
+    NONASSOC: 0
+    parseTable: ->
+      @table = [] # stateNum => { ..., symbolId => action, ... } where action looks like:
+      # [SHIFT, gotoStateNum] or [REDUCE, productionId] or [ACCEPT] or just gotoStateNum (for post-reduce)
+
+      conflictedStates = {}
+      [@SHIFT, @REDUCE, @ACCEPT] = [1..3]
+
+      for stateNum, state in @states
+        {edges, _items, reductions} = state
+
+        row = @table[stateNum] = {}
+
+        # set shift and goto actions
+        for inputSymbol, gotoStateNum of edges
+          # for {markedSymbol} in _items when markedSymbol is inputSymbol
+            # find shift and goto actions
+            row[@symbols_[inputSymbol]] =
+              if @nonterminals[inputSymbol]
+                # store state to go to after a reduce
+                gotoStateNum
+              else
+                [@SHIFT, gotoStateNum]
+
+        # set accept action
+        row[@symbols_[@EOF]] = [@ACCEPT] for {markedSymbol} in _items when markedSymbol is @EOF
+
+        # set reductions and resolve potential conflicts
+        reductions.forEach (item) =>
+          {production} = item
+          # if parser uses lookahead, only enumerate those terminals
+          (@lookAheads?(state, item) ? @terminals)
+          .forEach (reduceableInputSymbol) =>
+            reduceableInputSymbolId = @symbols_[reduceableInputSymbol]
+            action = row[reduceableInputSymbolId]
+
+            # Reading a terminal and current position is at the end of a production, try to reduce
+            if action
+              solution = @resolveConflict {
+                production
+                operator: @operators[reduceableInputSymbol]
+                reduce: [@REDUCE, production.id]
+                shift:
+                  if isArray action[0]
+                    action[0]
+                  else
+                    action
+              }
+              @resolutions.push [stateNum, reduceableInputSymbol, solution]
+              if solution.bydefault
+                @conflicts++
+                unless @DEBUG
+                  @warn """
+                    Conflict in grammar: multiple actions possible when lookahead token is #{ reduceableInputSymbol } in state #{ stateNum }
+                    - #{ @printAction solution.reduce }
+                    - #{ @printAction solution.shift }
+                  """
+                  conflictedStates[stateNum] = yes
+                if @options.noDefaultResolve
+                  action = [action] unless isArray action[0]
+                  action.push solution.reduce
+              else
+                action = solution.action
+            else
+              action = [@REDUCE, production.id]
+            if action?.length
+              row[reduceableInputSymbolId] = action
+            else if action is @NONASSOC
+              row[reduceableInputSymbolId] = undefined
+
+      if @conflicts > 0 and not @DEBUG
+        @warn """
+        
+          States with conflicts:#{
+            each conflictedStates, (val, state) =>
+              "State #{ state }  #{ @states[state].join '\n  ' }
+          }
+        """
+
+      @table
+
+    # resolves shift-reduce and reduce-reduce conflicts
+    resolveConflict: ({production, operator, reduce, shift}) ->
+      solution = {production, operator, reduce, shift}
+
+      if shift[0] is @REDUCE
+        solution.msg = 'Resolve R/R conflict (use first production declared in grammar.)'
+        solution.action =
+          if shift[1] < reduce[1]
+            shift
+          else
+            reduce
+        solution.bydefault = yes unless shift[1] is reduce[1]
+        return solution
+
+      extend solution,
+        if production.precedence is 0 or not operator
+          msg: 'Resolve S/R conflict (shift by default.)'
+          bydefault: yes
+          action: shift
+        else if production.precedence < operator.precedence
+          msg: 'Resolve S/R conflict (shift for higher precedent operator.)'
+          action: shift
+        else if production.precedence is operator.precedence
+          switch operator.assoc
+            when 'right'
+              msg: 'Resolve S/R conflict (shift for right associative operator.)'
+              action: shift
+            when 'left'
+              msg: 'Resolve S/R conflict (reduce for left associative operator.)'
+              action: reduce
+            when 'nonassoc'
+              msg: 'Resolve S/R conflict (no action for non-associative operator.)'
+              action: @NONASSOC
+        else
+          msg: 'Resolve conflict (reduce for higher precedent production.)'
+          action: reduce
+
+    # find states with only one action, a reduction
+    findDefaults: ->
+      @defaultActions = {} # stateNum => [REDUCE, productionId]
+      @table.forEach (symbolActions, stateNum) =>
+        return unless [symbolId for own symbolId of symbolActions].length is 1
+        loneAction = symbolActions[symbolId]
+        return unless loneAction[0] is @REDUCE
+
+        # only one action in state and it's a reduction
+        @defaultActions[stateNum] = loneAction
+
+      @defaultActions
+
     generate: (opt) ->
-      opt = typal.mix.call {}, @options, opt
+      opt = extended @options, opt
       code = ''
 
       # check for illegal identifier
@@ -847,7 +841,7 @@ Jison.Parser = do ->
           @generateCommonJSModule opt
 
     generateAMDModule: (opt) ->
-      opt = typal.mix.call {}, @options, opt
+      opt = extended @options, opt
 
       module = do @generateModule_
       """
@@ -871,7 +865,7 @@ Jison.Parser = do ->
       """
 
     generateCommonJSModule: (opt) ->
-      opt = typal.mix.call {}, @options, opt
+      opt = extended @options, opt
       moduleName = opt.moduleName or 'parser'
       """
       #{ @generateModule opt }
@@ -889,7 +883,7 @@ Jison.Parser = do ->
       """
 
     generateModule: (opt) ->
-      opt = typal.mix.call {}, @options, opt
+      opt = extended @options, opt
       moduleName = opt.moduleName or 'parser'
       """
       /* parser generated by jison #{ version } */
@@ -1071,6 +1065,81 @@ Jison.Parser = do ->
           };
           """
 
+    # Generate code that represents the specified parser table
+    generateTableCode: ->
+      moduleCode = JSON.stringify @table
+      variables = [createObjectCode]
+
+      # Don't surround numerical property name numbers in quotes
+      moduleCode = moduleCode.replace(/"([0-9]+)"(?=:)/g, "$1");
+
+      # Replace objects with several identical values by function calls
+      # e.g., { 1: [6, 7]; 3: [6, 7], 4: [6, 7], 5: 8 } = o([1, 3, 4], [6, 7], { 5: 8 })
+      moduleCode = moduleCode.replace(/\{\d+:[^\}]+,\d+:[^\}]+\}/g, function (object) {
+        # Find the value that occurs with the highest number of keys
+        var value, frequentValue, key, keys = {}, keyCount, maxKeyCount = 0,
+            keyValue, keyValues = [], keyValueMatcher = /(\d+):([^:]+)(?=,\d+:|\})/g;
+
+        while keyValue=keyValueMatcher.exec object
+          # For each value, store the keys where that value occurs
+          key = keyValue[1]
+          value = keyValue[2]
+          keyCount = 1
+
+          if value not of keys
+            keys[value] = [key]
+          else
+            keyCount = keys[value].push key
+          # Remember this value if it is the most frequent one
+          if keyCount > maxKeyCount
+            maxKeyCount = keyCount;
+            frequentValue = value;
+        # Construct the object with a function call if the most frequent value occurs multiple times
+        if maxKeyCount > 1
+          # Collect all non-frequent values into a remainder object
+          for (value in keys) {
+              if (value !== frequentValue) {
+                  for (var k = keys[value], i = 0, l = k.length; i < l; i++) {
+                      keyValues.push(k[i] + ':' + value);
+                  }
+              }
+          }
+          keyValues = keyValues.length ? ',{' + keyValues.join(',') + '}' : '';
+          # Create the function call `o(keys, value, remainder)`
+          object = 'o([' + keys[frequentValue].join(',') + '],' + frequentValue + keyValues + ')';
+        object
+
+      # Count occurrences of number lists
+      lists = {}
+      listMatcher = ///
+        \[
+        [0-9,] +
+        \]
+      ///g
+
+      while list=listMatcher.exec moduleCode
+        lists[list] = (lists[list] or 0) + 1
+
+      # Replace frequently occurring number lists with variables
+      moduleCode = moduleCode.replace listMatcher, (list) ->
+        listId = lists[list]
+        # If listId is a number, it represents the list's occurrence frequency
+        if isNumber listId
+          # If the list does not occur frequently, represent it by the list
+          if listId is 1
+            lists[list] = listId = list
+          # If the list occurs frequently, represent it by a newly assigned variable
+          else
+            lists[list] = listId = do createVariable
+            variables.push "#{ listId }=#{ list }"
+        listId
+
+      # Return the variable initialization code and the table code
+      {
+        commonCode: "var #{ variables.join ',' };"
+        moduleCode
+      }
+
     createParser: ->
       p = eval do @generateModuleExpr
 
@@ -1094,87 +1163,6 @@ Jison.Parser = do ->
       p
 
 
-  // Generate code that represents the specified parser table
-  lrGeneratorMixin.generateTableCode = function (table) {
-      var moduleCode = JSON.stringify(table);
-      var variables = [createObjectCode];
-
-      // Don't surround numerical property name numbers in quotes
-      moduleCode = moduleCode.replace(/"([0-9]+)"(?=:)/g, "$1");
-
-      // Replace objects with several identical values by function calls
-      // e.g., { 1: [6, 7]; 3: [6, 7], 4: [6, 7], 5: 8 } = o([1, 3, 4], [6, 7], { 5: 8 })
-      moduleCode = moduleCode.replace(/\{\d+:[^\}]+,\d+:[^\}]+\}/g, function (object) {
-          // Find the value that occurs with the highest number of keys
-          var value, frequentValue, key, keys = {}, keyCount, maxKeyCount = 0,
-              keyValue, keyValues = [], keyValueMatcher = /(\d+):([^:]+)(?=,\d+:|\})/g;
-
-          while ((keyValue = keyValueMatcher.exec(object))) {
-              // For each value, store the keys where that value occurs
-              key = keyValue[1];
-              value = keyValue[2];
-              keyCount = 1;
-
-              if (!(value in keys)) {
-                  keys[value] = [key];
-              } else {
-                  keyCount = keys[value].push(key);
-              }
-              // Remember this value if it is the most frequent one
-              if (keyCount > maxKeyCount) {
-                  maxKeyCount = keyCount;
-                  frequentValue = value;
-              }
-          }
-          // Construct the object with a function call if the most frequent value occurs multiple times
-          if (maxKeyCount > 1) {
-              // Collect all non-frequent values into a remainder object
-              for (value in keys) {
-                  if (value !== frequentValue) {
-                      for (var k = keys[value], i = 0, l = k.length; i < l; i++) {
-                          keyValues.push(k[i] + ':' + value);
-                      }
-                  }
-              }
-              keyValues = keyValues.length ? ',{' + keyValues.join(',') + '}' : '';
-              // Create the function call `o(keys, value, remainder)`
-              object = 'o([' + keys[frequentValue].join(',') + '],' + frequentValue + keyValues + ')';
-          }
-          return object;
-      });
-
-      // Count occurrences of number lists
-      var list;
-      var lists = {};
-      var listMatcher = /\[[0-9,]+\]/g;
-
-      while (list = listMatcher.exec(moduleCode)) {
-          lists[list] = (lists[list] || 0) + 1;
-      }
-
-      // Replace frequently occurring number lists with variables
-      moduleCode = moduleCode.replace(listMatcher, function (list) {
-          var listId = lists[list];
-          // If listId is a number, it represents the list's occurrence frequency
-          if (typeof listId === 'number') {
-              // If the list does not occur frequently, represent it by the list
-              if (listId === 1) {
-                  lists[list] = listId = list;
-              // If the list occurs frequently, represent it by a newly assigned variable
-              } else {
-                  lists[list] = listId = createVariable();
-                  variables.push(listId + '=' + list);
-              }
-          }
-          return listId;
-      });
-
-      // Return the variable initialization code and the table code
-      return {
-          commonCode: 'var ' + variables.join(',') + ';',
-          moduleCode: moduleCode
-      };
-  };
   // Function that extends an object with the given value for all given keys
   // e.g., o([1, 3, 4], [6, 7], { x: 1, y: 2 }) = { 1: [6, 7]; 3: [6, 7], 4: [6, 7], x: 1, y: 2 }
   var createObjectCode = 'o=function(k,v,o,l){' +
@@ -1198,31 +1186,35 @@ Jison.Parser = do ->
   var variableTokens = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$';
   var variableTokensLength = variableTokens.length;
 
-  // default main method for generated commonjs modules
-  function commonjsMain (args) {
-      if (!args[1]) {
-          console.log('Usage: '+args[0]+' FILE');
-          process.exit(1);
-      }
-      var source = require('fs').readFileSync(require('path').normalize(args[1]), "utf8");
-      return exports.parser.parse(source);
-  }
+  # default main method for generated commonjs modules
+  commonjsMain = (program, filename) ->
+    unless filename
+      console.log "Usage: #{ program } FILE"
+      process.exit 1
+    {readFileSync} = require 'fs'
+    {normalize} = require 'path'
+    source = readFileSync normalize(filename), 'utf8'
+    exports.parser.parse source
 
   # debug mixin for LR parser generators
   lrGeneratorDebugMixin =
     beforeparseTable: ->
       @trace 'Building parse table.'
     afterparseTable: ->
-      printAction = (action) =>
+      @printAction = (action) =>
         switch action[0]
           when 1 then "shift token (then go to state #{ action[1] })"
           when 2 then "reduce by rule: #{ @productions[action[1]]}"
           else        'accept'
 
       if @conflicts
-        @resolutions.forEach ([state, token, {bydefault, r, s}]) =>
+        @resolutions.forEach ([state, token, {bydefault, reduce, shift}]) =>
           if bydefault
-            @warn 'Conflict at state: ', state, ', token: ', token, '\n  ', printAction(r), '\n  ', printAction s
+            @warn """
+              Conflict at state: #{ state }, token: #{ token }
+                #{ @printAction reduce }
+                #{ @printAction shift }
+            """
         @trace "\n#{ @conflicts } Conflict(s) found in grammar."
       @trace 'Done.'
     aftercanonicalCollection: (states) ->
@@ -1258,27 +1250,27 @@ Jison.Parser = do ->
   parser.parseError = lrGeneratorMixin.parseError = parseError;
 
   generators = {}
-  registerGenerator = (name, klass, construct=yes) ->
-    generators[name] = exports["#{ do name.toUpperCase }Generator"] =
-      if contruct
-        do klass.construct
+  typeFromNameRegex = /^(.+)(\d)$/
+  registerGenerator = (name, klass) ->
+    klass::type ?=
+      if matched=typeFromNameRegex.exec name
+        [baseName, numLookaheads] = matched
+        "#{ do baseName.toUpperCase }(#{ numLookaheads })"
       else
-        klass
+        "#{ do name.toUpperCase }(1)"
+    generators[name] = exports["#{ do name.toUpperCase }Generator"] = klass
 
   ###
   # LR(0) Parser
   ###
-  registerGenerator 'lr0', generator.beget lookaheadMixin, lrGeneratorMixin,
-    type: 'LR(0)'
+  registerGenerator 'lr0', generator.construct lookaheadMixin, lrGeneratorMixin,
     afterconstructor: ->
       do @buildTable
 
   ###
   # Simple LALR(1)
   ###
-  registerGenerator 'lalr', generator.beget lookaheadMixin, lrGeneratorMixin,
-    type: 'LALR(1)'
-
+  registerGenerator 'lalr', generator.construct lookaheadMixin, lrGeneratorMixin,
     afterconstructor: function (grammar, options) {
         if (this.DEBUG) this.mix(lrGeneratorDebugMixin, lalrGeneratorDebug); // mixin debug methods
 
@@ -1311,7 +1303,7 @@ Jison.Parser = do ->
         this.unionLookaheads();
 
         this.table = this.parseTable();
-        this.defaultActions = findDefaults(this.table);
+        this.defaultActions = do @findDefaults
     },
 
     lookAheads: function LALR_lookaheads (state, item) {
@@ -1412,98 +1404,53 @@ Jison.Parser = do ->
   # SLR Parser
   ###
   registerGenerator 'slr', lrLookaheadGenerator.construct
-    type: 'SLR(1)'
-
     lookAheads: (state, item) ->
       @nonterminals[item.production.head].follows
-  , no
 
   ###
   # LR(1) Parser
   ###
-  registerGenerator 'lr1', lrLookaheadGenerator.beget
-    type: "Canonical LR(1)",
+  registerGenerator 'lr1', lrLookaheadGenerator.construct
+    type: 'Canonical LR(1)'
 
-    lookAheads: function LR_lookAheads (state, item) {
-        return item.follows;
-    },
-    Item: lrGeneratorMixin.Item.prototype.construct({
-        afterconstructor: function () {
-            this.id = this.production.id+'a'+this.dotPosition+'a'+this.follows.sort().join(',');
-        },
-        eq: function (e) {
-            return e.id === this.id;
-        }
-    }),
+    lookAheads: (state, item) ->
+      item.follows
 
-    closureOperation: function LR_ClosureOperation (itemSet /*, closureSet*/) {
-      itemSet = new @ItemSet arguments... unless itemSet instanceof @ItemSet
-      return itemSet if do itemSet.isEmpty
-        var closureSet = new this.ItemSet();
-        var self = this;
-
-        var set = itemSet,
-            itemQueue, syms = {};
-
-        do {
-        itemQueue = new Set();
-        closureSet.concat(set);
-        set.forEach(function (item) {
-            var symbol = item.markedSymbol;
-            var b, r;
-
-            // if token is a nonterminal, recursively add closures
-            if (symbol && self.nonterminals[symbol]) {
-                r = item.remainingBody();
-                b = self.first(item.remainingBody());
-                if (b.length === 0 || item.production.nullable || self.nullable(r)) {
-                    b = b.concat(item.follows);
-                }
-                self.nonterminals[symbol].productions.forEach(function (production) {
-                    var newItem = new self.Item({production, dotPosition: 0, follows: b);
-                    if(!closureSet.contains(newItem) && !itemQueue.contains(newItem)) {
-                        itemQueue.push(newItem);
-                    }
-                });
-            } else if (!symbol) {
-                // reduction
-                closureSet.reductions.push(item);
-            }
-        });
-
-        set = itemQueue;
-        } while (!itemQueue.isEmpty());
-
-        return closureSet;
-    }
-
-
+    closureOperation: (itemSet) ->
+      @_closureOperation {
+        itemSet
+        ifNonterminal: ({ item, itemQueue, markedSymbol, closureSet }) =>
+          remainingBody = do item.remainingBody
+          follows = @first remainingBody
+          if follows.length is 0 or item.production.nullable or @nullable remainingBody
+            follows = follows.concat item.follows
+          @nonterminals[markedSymbol].productions.forEach (production) =>
+            newItem = new @Item { production, follows }
+            itemQueue.push newItem unless closureSet.contains(newItem) or itemQueue.contains newItem
+      }
 
   ###
   # LL Parser
   ###
-  registerGenerator 'll',
-    generator.beget lookaheadMixin,
-      type: 'LL(1)'
-
-      afterconstructor: ->
-        do @computeLookaheads
-        @table = @parseTable @productions
-      parseTable: (productions) ->
-        table = {}
-        productions.forEach (production, productionIndex) =>
-          {head, first, body} = production
-          row = table[head] or {}
-          tokens = first
-          Set.union tokens, @nonterminals[head].follows if @nullable body
-          tokens.forEach (token) =>
-            if row[token]
-              row[token].push productionIndex
-              @conflicts++
-            else
-              row[token] = [productionIndex]
-          table[head] = row
-        table
+  registerGenerator 'll', generator.construct lookaheadMixin,
+    afterconstructor: ->
+      do @computeLookaheads
+      @table = @parseTable @productions
+    parseTable: (productions) ->
+      table = {}
+      productions.forEach (production, productionIndex) =>
+        {head, first, body} = production
+        row = table[head] or {}
+        tokens = first
+        Set.union tokens, @nonterminals[head].follows if @nullable body
+        tokens.forEach (token) =>
+          if row[token]
+            row[token].push productionIndex
+            @conflicts++
+          else
+            row[token] = [productionIndex]
+        table[head] = row
+      table
 
   Jison.Generator = (grammar, options) ->
     opt = extended grammar.options, options

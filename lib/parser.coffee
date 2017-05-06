@@ -1,6 +1,6 @@
 parser =
   parse: (input, args...) ->
-    stack = [0]
+    stack = [0] # [..., symbolId, stateNum, ...]
     tstack = [] # token stack
     vstack = [null] # semantic value stack
     lstack = [] # location stack
@@ -10,6 +10,7 @@ parser =
     recovering = 0
     TERROR = 2
     EOF = 1
+    [SHIFT, REDUCE, ACCEPT] = [1..3]
 
     #this.reductionCount = this.shiftCount = 0;
 
@@ -46,17 +47,16 @@ parser =
       # if token isn't its numeric value, convert
       @symbols_[token] or token
 
-    symbol = null
+    nextInputSymbolId = null
     loop
-      # retrieve state number from top of stack
-      [..., state] = stack
+      [..., stateNum] = stack
 
       # use default actions if available
       action =
-        @defaultActions[state] ? do =>
-          symbol = lex() unless symbol?
+        @defaultActions[stateNum] ? do =>
+          nextInputSymbolId ?= lex()
           # read action for current state and first input
-          @table[state]?[symbol]
+          @table[stateNum]?[nextInputSymbolId]
 
 # _handle_error:
       # handle parse error
@@ -64,121 +64,112 @@ parser =
       unless action?[0]
         # Return the rule stack depth where the nearest error rule can be found.
         # Return FALSE when no error recovery rule was found.
-        locateNearestErrorRecoveryRule = (state) =>
+        locateNearestErrorRecoveryRule = (stateNum) =>
           stack_probe = stack.length - 1
           depth = 0
 
           # try to recover from error
           loop
             # check for error recovery rule in this state
-            return depth if TERROR.toString() in @table[state]
-            return no if state is 0 or stack_probe < 2 # No suitable error recovery rule available.
+            return depth if TERROR.toString() in @table[stateNum]
+            return no if stateNum is 0 or stack_probe < 2 # No suitable error recovery rule available.
             stack_probe -= 2 # popStack(1): [symbol, action]
-            state = stack[stack_probe]
+            stateNum = stack[stack_probe]
             ++depth
 
         unless recovering
           # first see if there's any chance at hitting an error recovery rule:
-          error_rule_depth = locateNearestErrorRecoveryRule state
+          error_rule_depth = locateNearestErrorRecoveryRule stateNum
 
           # Report error
           expected =
-            "'#{@terminals_[p]}'" for p of @table[state] when @terminals_[p] and p > TERROR
+            "'#{@terminals_[p]}'" for p of @table[stateNum] when @terminals_[p] and p > TERROR
           errStr =
             "Parse error on line #{yylineno + 1}:#{
               if lexer.showPosition
-                "\n#{ lexer.showPosition() }\nExpecting #{ expected.join ', ' }, got '#{ @terminals_[symbol] or symbol }'"
+                "\n#{ lexer.showPosition() }\nExpecting #{ expected.join ', ' }, got '#{ @terminals_[nextInputSymbolId] or nextInputSymbolId }'"
               else
                 " Unexpected #{
-                  if symbol == EOF
+                  if nextInputSymbolId == EOF
                     "end of input"
                   else
-                    "'#{ @terminals_[symbol] or symbol }'" }"
+                    "'#{ @terminals_[nextInputSymbolId] or nextInputSymbolId }'" }"
             }"
           @parseError errStr, {
             text: lexer.match
-            token: @terminals_[symbol] or symbol
+            token: @terminals_[nextInputSymbolId] or nextInputSymbolId
             line: lexer.yylineno
             loc: yylloc
             expected
             recoverable: error_rule_depth isnt no
           }
         else if preErrorSymbol isnt EOF
-          error_rule_depth = locateNearestErrorRecoveryRule state
+          error_rule_depth = locateNearestErrorRecoveryRule stateNum
 
         # just recovered from another error
         if recovering == 3
-          throw new Error errStr or 'Parsing halted while starting to recover from another error.' if symbol is EOF or preErrorSymbol is EOF
+          throw new Error errStr or 'Parsing halted while starting to recover from another error.' if nextInputSymbolId is EOF or preErrorSymbol is EOF
 
           # discard current lookahead and grab another
           {yyleng, yytext, yylineno, yylloc} = lexer
-          symbol = lex()
+          nextInputSymbolId = lex()
 
         # try to recover from error
         throw new Error errStr || 'Parsing halted. No suitable error recovery rule available.' if error_rule_depth is no
         popStack error_rule_depth
 
         preErrorSymbol =
-          symbol unless symbol == TERROR # save the lookahead token
-        symbol = TERROR # insert generic error symbol as new lookahead
-        state = stack[stack.length-1]
-        action = @table[state]?[TERROR]
+          nextInputSymbolId unless nextInputSymbolId == TERROR # save the lookahead token
+        nextInputSymbolId = TERROR # insert generic error symbol as new lookahead
+        [..., stateNum] = stack
+        action = @table[stateNum]?[TERROR]
         recovering = 3 # allow 3 real symbols to be shifted before reporting a new error
 
       # this shouldn't happen, unless resolve defaults are off
-      throw new Error "Parse Error: multiple actions possible at state: #{state}, token: #{symbol}" if action[0] instanceof Array and action.length > 1
+      throw new Error "Parse Error: multiple actions possible at state: #{stateNum}, token: #{nextInputSymbolId}" if action[0] instanceof Array and action.length > 1
 
       switch action[0]
-        when 1 # shift
+        when SHIFT
           #this.shiftCount++;
 
-          stack.push symbol
+          stack.push nextInputSymbolId, action[1] # gotoStateNum
           vstack.push lexer.yytext
           lstack.push lexer.yylloc
-          stack.push action[1] # push state
-          symbol = null
+          nextInputSymbolId = null
           unless preErrorSymbol # normal execution/no error
             {yyleng, yytext, yylineno, yylloc} = lexer
             recovering-- if recovering > 0
           else
             # error just occurred, resume old lookahead f/ before error
-            symbol = preErrorSymbol
+            nextInputSymbolId = preErrorSymbol
             preErrorSymbol = null
-        when 2 # reduce
+        when REDUCE
           #this.reductionCount++;
+          productionId = action[1]
+          [headSymbolId, bodyLength] = @productions_[productionId]
 
-          len = @productions_[action[1]][1]
-
-          lstack_last = lstack[lstack.length - 1]
-          lstack_len_last = lstack[lstack.length - (len or 1)]
           # perform semantic action
-          yyval =
-            $: vstack[vstack.length - len] # default to $$ = $1
+          yyval = do ->
+            [..., lstack_last] = lstack
+            lstack_len_last = lstack[lstack.length - (bodyLength or 1)]
+            $: vstack[vstack.length - bodyLength] # default to $$ = $1
             # default location, uses first token for firsts, last for lasts
             _$:
               first_line: lstack_len_last.first_line
               last_line: lstack_last.last_line
               first_column: lstack_len_last.first_column
               last_column: lstack_last.last_column
-          if ranges
-            yyval._$.range = [lstack_len_last.range[0], lstack_last.range[1]]
-          r = @performAction.apply yyval, [yytext, yyleng, yylineno, yy, action[1], vstack, lstack, args...]
-          return r if typeof r isnt 'undefined'
+              range: [lstack_len_last.range[0], lstack_last.range[1]] if ranges
+          actionReturned =
+            @performAction.apply yyval, [yytext, yyleng, yylineno, yy, productionId, vstack, lstack, args...]
+          return actionReturned if actionReturned?
 
-          # pop off stack
-          if len
-            stack  = stack.slice  0, -1 * len * 2
-            vstack = vstack.slice 0, -1 * len
-            lstack = lstack.slice 0, -1 * len
-
-          stack.push @productions_[action[1]][0] # push nonterminal (reduce)
+          popStack bodyLength if bodyLength
+          [..., prevStateNum] = stack
+          stack.push headSymbolId, @table[prevStateNum][headSymbolId] # post-reduce gotoStateNum
           vstack.push yyval.$
           lstack.push yyval._$
-          # goto new state = @table[STATE][NONTERMINAL]
-          newState = @table[stack[stack.length - 2]][stack[stack.length - 1]]
-          stack.push newState
-        when 3
-          # accept
+        when ACCEPT
           return yes
     yes
   init: ({@table, @defaultActions, @performActions, @productions_, @symbols_, @terminals_}) ->
