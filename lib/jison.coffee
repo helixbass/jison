@@ -486,7 +486,7 @@ Jison.Parser = do ->
 
             # for Simple LALR algorithm, @go_ checks if
             q = @go_ head, body[0...i] if isSimpleLALR
-            bool = not isSimpleLALR or q is parseInt @nterms_[symbol], 10
+            bool = not isSimpleLALR or q is @strippedStateNums[symbol]
 
             if i is body.length + 1 and bool # TODO: how could i ever be that?
               set = @nonterminals[head].follows
@@ -553,7 +553,7 @@ Jison.Parser = do ->
             production: @productions[0]
             follows: [@EOF]
         )
-      @states = []
+      @states = [] # [..., ItemSet, ...]
       @states.has = {}
       @newOrExistingStateNum firstState
 
@@ -591,7 +591,7 @@ Jison.Parser = do ->
       constructor: ->
         super
         @reductions = []
-        @goes = {}
+        @goes = {} # bodyString => [..., comboSymbol, ...]
         @edges = {} # symbol => gotoStateNum
         @shifts = no
         @inadequate = no
@@ -1042,73 +1042,136 @@ Jison.Parser = do ->
         parseFn = removeErrorRecovery parseFn unless @hasErrorRecovery
         parseFn = addTokenStack parseFn if @options['token-stack']
 
-        # Generate code with fresh variable names
-        nextVariableId = 0
-        tableCode = @generateTableCode @table
+        {commonCode, tableCode} = @generateTableCode @table
 
-        # Generate the initialization code
-        commonCode: tableCode.commonCode
+        {
+          # Generate the initialization code
+          commonCode
 
-        # Generate the module creation code
-        moduleCode:
-          """
-          { trace: #{ String(@trace or parser.trace) }
-          yy: {},
-          symbols_: #{ JSON.stringify @symbols_ },
-          terminals_: #{ JSON.stringify(@terminals_).replace(/"([0-9]+)":/g,"$1:") },
-          productions_: #{ JSON.stringify @productions_ },
-          performAction: #{ String @performAction },
-          table: #{ tableCode.moduleCode },
-          defaultActions: #{ JSON.stringify(this.defaultActions).replace(/"([0-9]+)":/g,"$1:") },
-          parseError: #{ String(@parseError or (if @hasErrorRecovery then traceParseError else parser.parseError)) },
-          parse: #{ parseFn }
-          };
-          """
+          # Generate the module creation code
+          moduleCode: do =>
+            _str = (val, key) ->
+              valStr =
+                if isString obj
+                  obj
+                else if isFunction obj
+                  String obj
+                else
+                  JSON.stringify obj
+              return valStr unless key in ['terminals_', 'defaultActions']
+              @stripNumericalPropertyNames valStr
+
+            """
+            { #{
+              [key, _str val, key] for own key, val of {
+                trace: @trace ? parser.trace
+                yy: {}
+                @symbols_
+                @terminals_
+                @productions_
+                @performAction
+                table: tableCode
+                @defaultActions
+                parseError: @parseError ? (if @hasErrorRecovery then traceParseError else parser.parseError)
+                parse: parseFn
+              }
+              .map ([key, strVal]) -> "#{ key }: #{ strVal }"
+              .join ',\n' }
+            };
+            """
+        }
+
+    # Don't surround numerical property name numbers in quotes
+    stripNumericalPropertyNames: (str) ->
+      str
+      .replace ///
+        "
+        ([0-9]+)
+        "
+        (?=:)
+      ///g, '$1'
 
     # Generate code that represents the specified parser table
     generateTableCode: ->
-      moduleCode = JSON.stringify @table
-      variables = [createObjectCode]
+      { tableCode, variables } =
+        @optimizeListCode
+          tableCode: @stripNumericalPropertyNames JSON.stringify @table
+          variables: [@createObjectCode]
 
-      # Don't surround numerical property name numbers in quotes
-      moduleCode = moduleCode.replace(/"([0-9]+)"(?=:)/g, "$1");
+      # Return the variable initialization code and the table code
+      {
+        commonCode: "var #{ variables.join ',' };"
+        tableCode
+      }
 
+    # Function that extends an object with the given value for all given keys
+    # e.g., o([1, 3, 4], [6, 7], { x: 1, y: 2 }) = { 1: [6, 7]; 3: [6, 7], 4: [6, 7], x: 1, y: 2 }
+    createObjectCode: ->
+      'o=function(k,v,o,l){' +
+      'for(o=o||{},l=k.length;l--;o[k[l]]=v);' +
+      'return o}'
+
+    optimizeListCode: ({tableCode, variables}) ->
+      @useListVariablesCode {
+        tableCode: @condenseRowCode { tableCode }
+        variables
+      }
+
+    condenseRowCode: ({tableCode}) ->
+      tableCode
       # Replace objects with several identical values by function calls
-      # e.g., { 1: [6, 7]; 3: [6, 7], 4: [6, 7], 5: 8 } = o([1, 3, 4], [6, 7], { 5: 8 })
-      moduleCode = moduleCode.replace(/\{\d+:[^\}]+,\d+:[^\}]+\}/g, function (object) {
+      # e.g., { 1: [6, 7], 3: [6, 7], 4: [6, 7], 5: 8 } = o([1, 3, 4], [6, 7], { 5: 8 })
+      .replace ///
+        \{
+        \d+
+        :
+        [^\}]+
+        ,
+        \d+
+        :
+        [^\}]+
+        \}
+      ///g, (objectStr) ->
         # Find the value that occurs with the highest number of keys
-        var value, frequentValue, key, keys = {}, keyCount, maxKeyCount = 0,
-            keyValue, keyValues = [], keyValueMatcher = /(\d+):([^:]+)(?=,\d+:|\})/g;
-
-        while keyValue=keyValueMatcher.exec object
+        keysWithValue = {}
+        maxKeyCount = 0
+        keyValueMatcher = ///
+          (\d+)   # key
+          :
+          ([^:]+) # value
+          (?=
+            ,\d+: # next key
+            |
+            \}   # end of object
+          )
+        ///g
+        while [[], key, value]=keyValueMatcher.exec objectStr
           # For each value, store the keys where that value occurs
-          key = keyValue[1]
-          value = keyValue[2]
-          keyCount = 1
-
-          if value not of keys
-            keys[value] = [key]
-          else
-            keyCount = keys[value].push key
+          keyCount =
+            (keysWithValue[value] ?= [])
+            .push key
           # Remember this value if it is the most frequent one
           if keyCount > maxKeyCount
-            maxKeyCount = keyCount;
-            frequentValue = value;
-        # Construct the object with a function call if the most frequent value occurs multiple times
-        if maxKeyCount > 1
-          # Collect all non-frequent values into a remainder object
-          for (value in keys) {
-              if (value !== frequentValue) {
-                  for (var k = keys[value], i = 0, l = k.length; i < l; i++) {
-                      keyValues.push(k[i] + ':' + value);
-                  }
-              }
-          }
-          keyValues = keyValues.length ? ',{' + keyValues.join(',') + '}' : '';
-          # Create the function call `o(keys, value, remainder)`
-          object = 'o([' + keys[frequentValue].join(',') + '],' + frequentValue + keyValues + ')';
-        object
+            maxKeyCount = keyCount
+            mostFrequentValue = value
 
+        # Construct the object with a function call if the most frequent value occurs multiple times
+        return objectStr unless maxKeyCount > 1
+        otherKeyValues =
+          # Collect all non-frequent values into a remainder object
+          for value, keyList of keysWithValue when value isnt mostFrequentValue
+            for key in keyList
+              "#{ key }:#{ value }"
+        # Create the function call `o(keys, value, remainder)`
+        "o([#{ keysWithValue[mostFrequentValue].join ',' }],#{
+          mostFrequentValue
+        }#{
+          if otherKeyValues.length
+            ",{#{ otherKeyValues.join ',' }}"
+          else ''
+        }"
+
+    useListVariablesCode: ({tableCode, variables}) ->
       # Count occurrences of number lists
       lists = {}
       listMatcher = ///
@@ -1116,75 +1179,66 @@ Jison.Parser = do ->
         [0-9,] +
         \]
       ///g
-
-      while list=listMatcher.exec moduleCode
+      while list=listMatcher.exec tableCode
         lists[list] = (lists[list] or 0) + 1
 
+      @variableTokensLength = @variableTokens.length
+      # Generate code with fresh variable names
+      @nextVariableId = 0
       # Replace frequently occurring number lists with variables
-      moduleCode = moduleCode.replace listMatcher, (list) ->
-        listId = lists[list]
-        # If listId is a number, it represents the list's occurrence frequency
-        if isNumber listId
-          # If the list does not occur frequently, represent it by the list
-          if listId is 1
-            lists[list] = listId = list
-          # If the list occurs frequently, represent it by a newly assigned variable
-          else
-            lists[list] = listId = do createVariable
-            variables.push "#{ listId }=#{ list }"
-        listId
+      tableCode = tableCode.replace listMatcher, (list) ->
+        listCount = lists[list]
+        return listCount unless isNumber listCount
 
-      # Return the variable initialization code and the table code
-      {
-        commonCode: "var #{ variables.join ',' };"
-        moduleCode
-      }
+        # If the list does not occur frequently, represent it by the list
+        return lists[list] = list if listCount is 1
+
+        # If the list occurs frequently, represent it by a newly assigned variable
+        lists[list] = newVarName = do @createVariable
+        variables.push "#{ newVarName }=#{ list }"
+        newVarName
+
+      { tableCode, variables }
+
+    nextVariableId: 0
+    variableTokens: '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$'
+    # Creates a variable with a unique name
+    createVariable: ->
+      id = @nextVariableId++
+      name = '$V'
+
+      loop
+        name += @variableTokens[id % @variableTokensLength]
+        id = ~~(id / @variableTokensLength)
+
+        break if id is 0
+
+      name
 
     createParser: ->
-      p = eval do @generateModuleExpr
+      parser = eval do @generateModuleExpr
 
       # for debugging
-      p.productions = @productions
+      parser.productions = @productions
 
       bind = (method) =>
         =>
-          @lexer = p.lexer
+          @lexer = parser.lexer
           @[method].apply @, arguments
 
       # backwards compatability
-      p.lexer = @lexer
-      p[method] = bind method for method in [
+      parser.lexer = @lexer
+      parser[method] = bind method for method in [
         'generate'
         'generateAMDModule'
         'generateModule'
         'generateCommonJSModule'
       ]
 
-      p
+      parser
 
 
-  // Function that extends an object with the given value for all given keys
-  // e.g., o([1, 3, 4], [6, 7], { x: 1, y: 2 }) = { 1: [6, 7]; 3: [6, 7], 4: [6, 7], x: 1, y: 2 }
-  var createObjectCode = 'o=function(k,v,o,l){' +
-      'for(o=o||{},l=k.length;l--;o[k[l]]=v);' +
-      'return o}';
 
-  // Creates a variable with a unique name
-  function createVariable() {
-      var id = nextVariableId++;
-      var name = '$V';
-
-      do {
-          name += variableTokens[id % variableTokensLength];
-          id = ~~(id / variableTokensLength);
-      } while (id !== 0);
-
-      return name;
-  }
-
-  var nextVariableId = 0;
-  var variableTokens = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$';
-  var variableTokensLength = variableTokens.length;
 
   # default main method for generated commonjs modules
   commonjsMain = (program, filename) ->
@@ -1271,117 +1325,106 @@ Jison.Parser = do ->
   # Simple LALR(1)
   ###
   registerGenerator 'lalr', generator.construct lookaheadMixin, lrGeneratorMixin,
-    afterconstructor: function (grammar, options) {
-        if (this.DEBUG) this.mix(lrGeneratorDebugMixin, lalrGeneratorDebug); // mixin debug methods
+    afterconstructor: (grammar, options={}) ->
+      @mix lrGeneratorDebugMixin, lalrGeneratorDebugMixin if @DEBUG
 
-        options = options || {};
-        this.canonicalCollection();
-        this.terms_ = {};
+      do @canonicalCollection
 
-        var newg = this.newg = typal.beget(lookaheadMixin,{
-            oldg: this,
-            trace: this.trace,
-            nterms_: {},
-            DEBUG: false,
-            go_: function (r, B) {
-                r = r.split(":")[0]; // grab state #
-                B = B.map(function (b) { return b.slice(b.indexOf(":")+1); });
-                return this.oldg.go(r, B);
-            }
-        });
-        newg.nonterminals = {};
-        newg.productions = [];
+      do @buildNewGrammar
+      do @newg.computeLookaheads
+      do @unionLookaheads
 
-        this.inadequateStates = [];
+      @table = do @parseTable
+      @defaultActions = do @findDefaults
 
-        // if true, only lookaheads in inadequate states are computed (faster, larger table)
-        // if false, lookaheads for all reductions will be computed (slower, smaller table)
-        this.onDemandLookahead = options.onDemandLookahead || false;
+    lookAheads: (state, item) ->
+      if @onDemandLookahead and not state.inadequate
+        @terminals
+      else
+        item.follows
 
-        this.buildNewGrammar();
-        newg.computeLookaheads();
-        this.unionLookaheads();
+    go: (p, w) ->
+      q = parseInt p, 10
+      for symbol in w
+        q = @states[q].edges[symbol] or q
+      q
 
-        this.table = this.parseTable();
-        this.defaultActions = do @findDefaults
-    },
+    goPath: (stateNum, body) ->
+      path =
+        for symbol in body
+          comboSymbol = @addComboSymbol { stateNum, symbol }
+          stateNum = @states[stateNum].edges[symbol] or stateNum
+          comboSymbol
+      { path, endState: stateNum }
 
-    lookAheads: function LALR_lookaheads (state, item) {
-        return (!!this.onDemandLookahead && !state.inadequate) ? this.terminals : item.follows;
-    },
-    go: function LALR_go (p, w) {
-        var q = parseInt(p, 10);
-        for (var i=0;i<w.length;i++) {
-            q = this.states[q].edges[w[i]] || q;
-        }
-        return q;
-    },
-    goPath: function LALR_goPath (p, w) {
-        var q = parseInt(p, 10),t,
-            path = [];
-        for (var i=0;i<w.length;i++) {
-            t = w[i] ? q+":"+w[i] : '';
-            if (t) this.newg.nterms_[t] = q;
-            path.push(t);
-            q = this.states[q].edges[w[i]] || q;
-            this.terms_[t] = w[i];
-        }
-        { path, endState: q }
     # every disjoint reduction of a nonterminal becomes a produciton in G'
     buildNewGrammar: ->
-        var self = this,
-            newg = this.newg;
+      @newg = typal.beget lookaheadMixin, {
+        oldg: @
+        @trace
+        strippedStateNums: {} # comboSymbol => stateNum
+        DEBUG: no
+        go_: (r, B) ->
+          r = r.split(":")[0] # grab state #
+          B = B.map (b) -> b.slice b.indexOf(':') + 1
+          @oldg.go r, B
+      }
+      @newg.nonterminals = {}
+      @newg.productions = []
 
-        this.states.forEach(function (state, i) {
-            state.forEach(function (item) {
-                if (item.dotPosition === 0) {
-                    # new symbols are a combination of state and transition symbol
-                    var symbol = i+":"+item.production.head;
-                    self.terms_[symbol] = item.production.head;
-                    newg.nterms_[symbol] = i;
-                    if (!newg.nonterminals[symbol])
-                        newg.nonterminals[symbol] = new Nonterminal(symbol);
-                    var pathInfo = self.goPath(i, item.production.body);
-                    var p = new Production(head: symbol, body: pathInfo.path, id: newg.productions.length);
-                    newg.productions.push(p);
-                    newg.nonterminals[symbol].productions.push(p);
+      @inadequateStates = []
+      @strippedSymbols = {} # comboSymbol => simpleSymbol
+      # if true, only lookaheads in inadequate states are computed (faster, larger table)
+      # if false, lookaheads for all reductions will be computed (slower, smaller table)
+      @onDemandLookahead = options.onDemandLookahead or no
 
-                    # store the transition that get's 'backed up to' after reduction on path
-                    var body = item.production.body.join(' ');
-                    var goes = self.states[pathInfo.endState].goes;
-                    if (!goes[body])
-                        goes[body] = [];
-                    goes[body].push(symbol);
+      for stateNum, state in @states
+        for item in state._items when item.dotPosition is 0
+          {production: {head, body}} = item
 
-                    #self.trace('new production:',p);
-                }
-            });
-            if (state.inadequate)
-                self.inadequateStates.push(i);
-        });
-    unionLookaheads: function LALR_unionLookaheads () {
-        var self = this,
-            newg = this.newg,
-            states = !!this.onDemandLookahead ? this.inadequateStates : this.states;
+          # new symbols are a combination of state and transition symbol
+          comboSymbol = @addComboSymbol { stateNum, symbol: head }
+          @newg.nonterminals[comboSymbol] ?= new Nonterminal comboSymbol
+          {path, endState} = @goPath stateNum, body
+          newProduction = new Production
+            head: comboSymbol
+            body: path
+            id: @newg.productions.length
+          @newg.productions.push newProduction
+          @newg.nonterminals[comboSymbol].productions.push newProduction
 
-        states.forEach(function union_states_forEach (i) {
-            var state = typeof i === 'number' ? self.states[i] : i,
-                follows = [];
-            if (state.reductions.length)
-            state.reductions.forEach(function union_reduction_forEach (item) {
-                var follows = {};
-                for (var k=0;k<item.follows.length;k++) {
-                    follows[item.follows[k]] = true;
-                state.goes[item.production.body.join(' ')].forEach(function reduction_goes_forEach (symbol) {
-                    newg.nonterminals[symbol].follows.forEach(function goes_follows_forEach (symbol) {
-                        var terminal = self.terms_[symbol];
-                        if (!follows[terminal]) {
-                            follows[terminal]=true;
-                            item.follows.push(terminal);
-                #self.trace('unioned item', item);
+          # store the transition that gets 'backed up to' after reduction on path
+          {goes} = @states[endState]
+          (goes[body.join ' '] ?= []).push comboSymbol
+
+          #@trace('new production:',p);
+
+        @inadequateStates.push stateNum if state.inadequate
+
+    addComboSymbol = ({stateNum, symbol}) ->
+      comboSymbol = if symbol then "#{ stateNum }:#{ symbol }" else ''
+      @strippedSymbols[comboSymbol] = symbol
+      @newg.strippedStateNums[comboSymbol] = stateNum if comboSymbol
+      comboSymbol
+
+    unionLookaheads: ->
+      if @onDemandLookahead then @inadequateStates else @states
+      .forEach (state) =>
+        state = @states[state] if isNumber state
+        for {follows, production: {body}} in state.reductions
+          alreadyFollows = {}
+          alreadyFollows[follow] = yes for follow in follows
+          addFollow = (symbol) ->
+            return if alreadyFollows[symbol]
+            follows.push symbol
+            alreadyFollows[symbol] = yes
+
+          state.goes[body.join ' '].forEach (_comboSymbol) =>
+            addFollow @strippedSymbols[comboSymbol] for comboSymbol in @newg.nonterminals[_comboSymbol].follows
+          #@trace 'unioned item', item
 
   # LALR generator debug mixin
-  lalrGeneratorDebug =
+  lalrGeneratorDebugMixin =
     trace: ->
       Jison.print arguments...
     beforebuildNewGrammar: ->
